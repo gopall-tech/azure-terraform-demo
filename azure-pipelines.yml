@@ -5,51 +5,35 @@ pool:
   vmImage: 'ubuntu-latest'
 
 steps:
-# 1. Install Terraform on the runner
-- task: TerraformInstaller@0
-  inputs:
-    terraformVersion: 'latest'
-
-# 2. Initialize Terraform (Downloads the Azure plugin)
-- task: TerraformTaskV4@4
-  displayName: 'Terraform Init'
-  inputs:
-    provider: 'azurerm'
-    command: 'init'
-    backendServiceArm: 'AzureConnection' # Matches the name you created in Part 3
-    backendAzureRmResourceGroupName: 'gopal-storage-RG' # Create this manually in Azure Portal first if you want to save state, or leave dummy for local test
-    backendAzureRmStorageAccountName: 'gopalstorage123' # Dummy for local test
-    backendAzureRmContainerName: 'tfstate'
-    backendAzureRmKey: 'terraform.tfstate'
-
-# Note: For a simple assignment without remote state storage, 
-# we can use a script instead of the official task to skip backend requirement:
-
+# 1. Install Terraform
 - script: |
-    terraform init
-    terraform plan -out=main.tfplan
-  displayName: 'Terraform Init & Plan'
-  env:
-    ARM_SUBSCRIPTION_ID: $(az account show --query id -o tsv) 
-    # Note: For the script to work, we need to log in. 
-    # The easier way for beginners is using the "TerraformTaskV4" with a Service Connection.
-    # Let's use the simplest verified block below:
+    sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
+    wget -O- https://apt.releases.hashicorp.com/gpg | \
+    gpg --dearmor | \
+    sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+    https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+    sudo tee /etc/apt/sources.list.d/hashicorp.list
+    sudo apt-get update && sudo apt-get install terraform
+  displayName: 'Install Latest Terraform'
 
-# SIMPLIFIED BLOCK FOR ASSIGNMENT (Copy this part)
-- task: TerraformTaskV4@4
-  displayName: 'Terraform Init'
+# 2. Run Terraform inside the Azure CLI Task (Fixes the login error)
+- task: AzureCLI@2
+  displayName: 'Terraform Init and Apply'
   inputs:
-    provider: 'azurerm'
-    command: 'init'
-    backendServiceArm: 'AzureConnection'
-    backendAzureRmResourceGroupName: '' # Leave empty to use local state (ephemeral)
-    backendAzureRmStorageAccountName: ''
-    backendAzureRmContainerName: ''
-    backendAzureRmKey: ''
+    azureSubscription: 'AzureConnection' # MUST match your Service Connection name
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    addSpnToEnvironment: true
+    inlineScript: |
+      # These lines pass the Service Connection credentials to Terraform
+      export ARM_CLIENT_ID=$servicePrincipalId
+      export ARM_CLIENT_SECRET=$servicePrincipalKey
+      export ARM_TENANT_ID=$tenantId
+      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
-- task: TerraformTaskV4@4
-  displayName: 'Terraform Apply'
-  inputs:
-    provider: 'azurerm'
-    command: 'apply'
-    environmentServiceNameAzureRM: 'AzureConnection'
+      echo "Initializing Terraform..."
+      terraform init
+
+      echo "Applying Terraform..."
+      terraform apply -auto-approve
