@@ -5,58 +5,122 @@ pool:
   vmImage: 'ubuntu-latest'
 
 variables:
-  # THESE MATCH THE RESOURCES YOU JUST CREATED
+  # UPDATE THESE if they changed
   bk_resource_group: 'gopal-terraform-backend'
   bk_storage_account: 'gopalstgbackend'
   bk_container_name: 'gopal-tfstate'
   bk_key: 'terraform.tfstate'
 
-steps:
-# 1. Create SSH Key for VM
-# This prevents the "file not found" error since the agent is fresh every time.
-- script: |
-    mkdir -p ~/.ssh
-    ssh-keygen -m PEM -t rsa -b 4096 -f ~/.ssh/id_rsa -N ""
-  displayName: 'Generate SSH Key for VMs'
+stages:
+# --- STAGE 1: DEV ---
+- stage: Dev
+  displayName: 'Dev Environment'
+  jobs:
+  - job: DeployDev
+    displayName: 'Deploy to Dev'
+    steps:
+    # 1. Create SSH Key
+    - script: |
+        mkdir -p ~/.ssh
+        ssh-keygen -m PEM -t rsa -b 4096 -f ~/.ssh/id_rsa -N ""
+      displayName: 'Generate SSH Key'
 
-# 2. Install Terraform
-- script: |
-    sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
-    wget -O- https://apt.releases.hashicorp.com/gpg | \
-    gpg --dearmor | \
-    sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
-    https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
-    sudo tee /etc/apt/sources.list.d/hashicorp.list
-    sudo apt-get update && sudo apt-get install terraform
-  displayName: 'Install Latest Terraform'
+    # 2. Install Terraform
+    - script: |
+        sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
+        wget -O- https://apt.releases.hashicorp.com/gpg | \
+        gpg --dearmor | \
+        sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+        https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+        sudo tee /etc/apt/sources.list.d/hashicorp.list
+        sudo apt-get update && sudo apt-get install terraform
+      displayName: 'Install Latest Terraform'
 
-# 3. Run Terraform Init and Apply
-- task: AzureCLI@2
-  displayName: 'Terraform Init and Apply'
-  inputs:
-    azureSubscription: 'AzureConnection' # MUST match your Service Connection name
-    scriptType: 'bash'
-    scriptLocation: 'inlineScript'
-    addSpnToEnvironment: true
-    inlineScript: |
-      # Export credentials for the provider
-      export ARM_CLIENT_ID=$servicePrincipalId
-      export ARM_CLIENT_SECRET=$servicePrincipalKey
-      export ARM_TENANT_ID=$tenantId
-      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+    # 3. Init and Apply (Dev)
+    - task: AzureCLI@2
+      displayName: 'Terraform Apply (Dev)'
+      inputs:
+        azureSubscription: 'AzureConnection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        addSpnToEnvironment: true
+        inlineScript: |
+          export ARM_CLIENT_ID=$servicePrincipalId
+          export ARM_CLIENT_SECRET=$servicePrincipalKey
+          export ARM_TENANT_ID=$tenantId
+          export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
-      echo "Initializing Terraform with Backend..."
-      # We inject the backend config here so we don't hardcode secrets in main.tf
-      terraform init \
-        -backend-config="resource_group_name=$(bk_resource_group)" \
-        -backend-config="storage_account_name=$(bk_storage_account)" \
-        -backend-config="container_name=$(bk_container_name)" \
-        -backend-config="key=$(bk_key)" \
-        -input=false
+          terraform init \
+            -backend-config="resource_group_name=$(bk_resource_group)" \
+            -backend-config="storage_account_name=$(bk_storage_account)" \
+            -backend-config="container_name=$(bk_container_name)" \
+            -backend-config="key=$(bk_key)" \
+            -input=false
 
-      echo "Planning Terraform..."
-      terraform plan -out=tfplan -input=false
+          # Ideally, we would restrict this to dev resources only, 
+          # but for now we apply the configuration to ensure the state is current.
+          terraform apply -auto-approve -input=false
 
-      echo "Applying Terraform..."
-      terraform apply -auto-approve tfplan -input=false
+# --- STAGE 2: PROD ---
+- stage: Prod
+  displayName: 'Prod Environment'
+  dependsOn: Dev # Waits for Dev to finish
+  jobs:
+  # JOB A: Manual Validation (The "Wait" Step)
+  - job: WaitForApproval
+    displayName: 'Manual Validation'
+    pool: server # Runs on Azure Server (Agentless)
+    timeoutInMinutes: 1440 # Waits up to 24 hours
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        notifyUsers: '' # Add email here if you want alerts
+        instructions: 'Please verify Dev environment is working before approving Prod.'
+
+  # JOB B: Deploy to Prod (Runs only after Approval)
+  - job: DeployProd
+    displayName: 'Deploy to Prod'
+    dependsOn: WaitForApproval
+    steps:
+    # 1. Create SSH Key (Again, because this is a new agent)
+    - script: |
+        mkdir -p ~/.ssh
+        ssh-keygen -m PEM -t rsa -b 4096 -f ~/.ssh/id_rsa -N ""
+      displayName: 'Generate SSH Key'
+
+    # 2. Install Terraform (Again)
+    - script: |
+        sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
+        wget -O- https://apt.releases.hashicorp.com/gpg | \
+        gpg --dearmor | \
+        sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+        https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+        sudo tee /etc/apt/sources.list.d/hashicorp.list
+        sudo apt-get update && sudo apt-get install terraform
+      displayName: 'Install Latest Terraform'
+
+    # 3. Init and Apply (Prod)
+    - task: AzureCLI@2
+      displayName: 'Terraform Apply (Prod)'
+      inputs:
+        azureSubscription: 'AzureConnection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        addSpnToEnvironment: true
+        inlineScript: |
+          export ARM_CLIENT_ID=$servicePrincipalId
+          export ARM_CLIENT_SECRET=$servicePrincipalKey
+          export ARM_TENANT_ID=$tenantId
+          export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+          # We must run Init again because this is a new computer
+          terraform init \
+            -backend-config="resource_group_name=$(bk_resource_group)" \
+            -backend-config="storage_account_name=$(bk_storage_account)" \
+            -backend-config="container_name=$(bk_container_name)" \
+            -backend-config="key=$(bk_key)" \
+            -input=false
+
+          terraform apply -auto-approve -input=false
